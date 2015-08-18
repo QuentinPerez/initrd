@@ -1,0 +1,222 @@
+# -*- shell-script -*-
+
+
+## Logging functions
+
+_log_msg() {
+    printf "${@}"
+}
+log_success_msg() {
+    _log_msg "Success: ${@}."
+}
+log_failure_msg() {
+    _log_msg "Failure: ${@}."
+}
+log_warning_msg() {
+    _log_msg "Warning: ${@}."
+}
+log_begin_msg() {
+    _log_msg "Begin: ${@} ... "
+}
+log_end_msg() {
+    _log_msg " done.\n"
+}
+log_fatal_msg() {
+    _log_msg "Fatal: ${@}\n"
+    sleep 5
+    reboot
+}
+
+
+# Signal to SCW the current server state
+signal_state() {
+    state="${1}"
+    RETRIES=30
+    METADATA_PORT=80
+    SLEEP_BETWEEN_RETRIES=1
+
+    log_begin_msg "Signaling the server is ${state} to the control plane"
+
+    retries=0
+    while [ "${retries}" -lt "${RETRIES}" ]; do
+        has_opt nometadata || scw-update-server-state "$state"
+        if [ ${?} -eq 0 ]; then
+            # log_success_msg "control plane is aware that server is ${state}"
+	    log_end_msg
+            return
+	fi
+	
+        retries=$((${retries}+1))
+        test ${retries} -eq ${RETRIES} || sleep ${SLEEP_BETWEEN_RETRIES}
+    done
+
+    log_failure_msg "unable to signal state=$state after ${RETRIES} attempts, continuing boot.."
+    log_end_msg
+}
+
+
+## Helpers
+
+resolve_hostnames() {
+    sed "s/metadata.local/${METADATA_IP}/g"
+}
+
+
+# Function for parsing command line options with "=" in them
+get_opt() {
+    key=$1
+    default=$2
+    ret=$(cat /proc/cmdline ${rootmnt}/proc/cmdline 2>/dev/null | tr " " "\n" | grep "^$1" | head -n 1 | cut -d "=" -f 2)
+    if [ -z "$ret" ]; then
+        echo "$default" | resolve_hostnames
+    else
+        echo "$ret" | resolve_hostnames
+    fi
+}
+
+has_opt() {
+    cat /proc/cmdline ${rootmnt}/proc/cmdline 2>/dev/null | tr " " "\n" | grep "^$1\$" >/dev/null
+}
+
+get_metadata() {
+    for idx in $(seq -w 0 $(oc-metadata --cached TAGS)); do
+	tag=$(oc-metadata --cached TAGS_$idx)
+	if [ $(echo "$tag" | grep "^$1=") ]; then
+	    echo $tag | sed 's/^[^=]*=//' | resolve_hostnames
+	    return
+	fi
+    done
+}
+
+has_metadata() {
+    (
+	for idx in $(seq -w 0 $(oc-metadata --cached TAGS)); do
+	    oc-metadata --cached TAGS_$idx
+	done
+    ) | grep "^$1\$" >/dev/null
+}
+
+get_any() {
+    key=$1
+    default=${2:-""}
+
+    ret=$(get_metadata $key)
+    if [ -n "$ret" ]; then
+	echo "$ret"
+    else
+	get_opt "$key" "$default"
+    fi
+}
+
+
+load_nolp_ko() {
+    log_begin_msg "Loading nolp kernel module"
+    wget -q http://169.254.42.24/kernel/$(uname -r)/custom/nolp.ko
+    insmod $(pwd)/nolp.ko
+    if [ $? -eq 0 ]; then
+        log_success_msg "nolp.ko successfully loaded"
+        log_end_msg
+    else
+        log_warning_msg "cannot load nolp.ko"
+        log_end_msg
+    fi
+}
+
+
+setup_gpios() {
+    # Switch booted GPIO to enable serial for user
+    echo 42 > /sys/class/gpio/export
+    echo out > /sys/class/gpio/gpio42/direction
+}
+
+
+# Attach NBD device
+NBD_CLIENT=/usr/sbin/@xnbd-client
+attach_nbd_device() {
+    local device="$1"  # ie: 0
+    local retries=900
+
+    log_begin_msg "Attaching nbd${device}"
+
+    # Fetching metadatas
+    local export_uri=$(oc-metadata --cached VOLUMES_${device}_EXPORT_URI)
+    [ "$export_uri" = "" ] && log_fatal_msg "Unable to load metadatas..."
+
+    local nbd_host=$(echo $export_uri | sed -n 's#nbd://\(.*\):.*$#\1#p')
+    local nbd_port=$(echo $export_uri | sed -n 's#nbd://.*:\(.*\)$#\1#p')
+    [ "$nbd_host" = "" -o "$nbd_port" = "" ] && log_fatal_msg "Parse error of $export_uri"
+
+
+    # Checking if device is already attached
+    $NBD_CLIENT -c /dev/nbd${device} >/dev/null 2>/dev/null
+    if [ $? -eq 0 ]; then
+        return
+    fi
+
+    # Connecting the device
+    (
+	export PATH=$(dirname $NBD_CLIENT)
+	$(basename $NBD_CLIENT) \
+	    --blocksize 4096 \
+	    --retry=$retries \
+	    $nbd_host $nbd_port \
+	    /dev/nbd${device} 2>/dev/null
+    )
+    local nbd_pid=$$
+    echo -1000 > /proc/$nbd_pid/oom_score_adj
+
+    # Checking if device is already attached
+    $NBD_CLIENT -c /dev/nbd${device} >/dev/null 2>/dev/null || \
+        log_fatal_msg "Device connection failed."
+
+    # Fixing IO scheduler
+    if grep -q '\[cfq\]' /sys/block/nbd${device}/queue/scheduler
+    then
+        echo deadline > /sys/block/nbd${device}/queue/scheduler
+    fi
+
+    log_end_msg
+}
+
+
+# Mount NBD
+mount_nbd() {
+    local device="$1"  # ie: 0
+    local dest="$2"    # ie: ${rootmnt}/
+
+    log_begin_msg "Mounting nbd${device} root"
+    mount /dev/nbd${device} ${dest}
+    if [ "${device}" = "0" ]; then
+	echo 0x0100 > /proc/sys/kernel/real-root-dev
+    fi
+    sync
+    log_end_msg
+}
+
+
+start_sshd() {
+    mkdir -p /etc/dropbear /root/.ssh
+    chmod 700 /root/.ssh
+    dropbearkey -t dss -f /etc/dropbear/dropbear_dss_host_key
+    dropbearkey -t rsa -f /etc/dropbear/dropbear_rsa_host_key
+    oc-metadata --cached | grep "SSH_PUBLIC_KEYS_.*_KEY" | cut -d'=' -f 2- | tr -d \' > /root/.ssh/authorized_keys
+    dropbear -d /etc/dropbear/dropbear_dss_host_key -r /etc/dropbear/dropbear_rsa_host_key
+}
+
+
+# ask metadata and automatically attach nbd>=1 devices
+attach_secondary_nbd_devices() {
+    log_begin_msg "Checking metadata in case we skip to wait for secondary volumes to be ready"
+    if [ "x$(get_any INITRD_SKIP_SECONDARY_VOLUMES)" != "x1" ]; then
+	log_end_msg
+	for volume in $(oc-metadata --cached VOLUMES); do
+	    log_begin_msg "Attaching nbd${volume}"
+	    if [ "${volume}" -ne "0" ]; then
+		setup_nbd_device "${volume}"
+	    fi
+	    log_end_msg
+	done
+    else
+	log_end_msg
+    fi
+}
